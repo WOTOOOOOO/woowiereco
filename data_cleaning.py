@@ -81,7 +81,7 @@ class CreditsDataCleaner:
             raise
     
     def clean_cast_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean and validate cast information."""
+        """Clean and validate cast information - keep only recommendation-relevant data."""
         logger.info("Cleaning cast data")
         
         # Parse cast JSON safely
@@ -89,39 +89,25 @@ class CreditsDataCleaner:
             lambda x: self.validator.safe_json_parse(x, [])
         )
         
-        # Extract useful cast metrics
-        df['num_cast_members'] = df['cast_parsed'].apply(lambda x: len(x) if isinstance(x, list) else 0)
-        df['has_cast_data'] = df['cast_parsed'].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)
-        
-        # Extract all actor names from cast
-        df['actor_names'] = df['cast_parsed'].apply(
+        # Extract all actor names (for collaborative filtering and content-based recommendations)
+        df['actors'] = df['cast_parsed'].apply(
             lambda x: [member.get('name', '') for member in x 
                       if isinstance(member, dict) and member.get('name')] if isinstance(x, list) else []
         )
         
-        # Extract character names
-        df['character_names'] = df['cast_parsed'].apply(
-            lambda x: [member.get('character', '') for member in x 
-                      if isinstance(member, dict) and member.get('character')] if isinstance(x, list) else []
+        # Extract main actors (top 5 by billing order for lead actor analysis)
+        df['lead_actors'] = df['cast_parsed'].apply(
+            lambda x: [member.get('name', '') for member in sorted(x, key=lambda m: m.get('order', 999))[:5] 
+                      if isinstance(member, dict) and member.get('name')] if isinstance(x, list) else []
         )
         
-        # Extract main cast (first 10 members by order) with detailed info
-        df['main_cast'] = df['cast_parsed'].apply(
-            lambda x: [{'name': member.get('name', ''), 
-                       'character': member.get('character', ''),
-                       'order': member.get('order', 999)} 
-                      for member in x if isinstance(member, dict) and member.get('order', 999) < 10] if isinstance(x, list) else []
-        )
-        
-        # Create concatenated string of all actor names for easy text analysis
-        df['actors_text'] = df['actor_names'].apply(
-            lambda x: ', '.join(x) if x else ''
-        )
+        # Actor count (useful feature for recommendation)
+        df['cast_size'] = df['actors'].apply(len)
         
         return df
     
     def clean_crew_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean and validate crew information."""
+        """Clean and validate crew information - keep only key roles for recommendations."""
         logger.info("Cleaning crew data")
         
         # Parse crew JSON safely
@@ -129,26 +115,7 @@ class CreditsDataCleaner:
             lambda x: self.validator.safe_json_parse(x, [])
         )
         
-        # Extract crew metrics
-        df['num_crew_members'] = df['crew_parsed'].apply(lambda x: len(x) if isinstance(x, list) else 0)
-        df['has_crew_data'] = df['crew_parsed'].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)
-        
-        # Extract all crew members with their roles/jobs and departments, sorted by department, job, name
-        df['crew_members'] = df['crew_parsed'].apply(
-            lambda x: sorted(
-                [
-                    {
-                        'name': member.get('name', ''),
-                        'job': member.get('job', ''),
-                        'department': member.get('department', '')
-                    }
-                    for member in x if isinstance(member, dict) and member.get('name')
-                ],
-                key=lambda m: (m['job'] or '', m['department'] or '', m['name'] or '')
-            ) if isinstance(x, list) else []
-        )
-        
-        # Extract specific key roles for backward compatibility and easy access
+        # Extract key roles that matter for movie recommendations
         df['directors'] = df['crew_parsed'].apply(
             lambda x: [member.get('name', '') for member in x 
                       if isinstance(member, dict) and member.get('job') == 'Director'] if isinstance(x, list) else []
@@ -164,9 +131,11 @@ class CreditsDataCleaner:
                       if isinstance(member, dict) and member.get('department') == 'Writing'] if isinstance(x, list) else []
         )
         
-        # Create text representations for analysis
-        df['crew_text'] = df['crew_members'].apply(
-            lambda x: ', '.join([f"{member['name']} ({member['job']})" for member in x]) if x else ''
+        # Music composers (important for some recommendation algorithms)
+        df['composers'] = df['crew_parsed'].apply(
+            lambda x: [member.get('name', '') for member in x 
+                      if isinstance(member, dict) and 'Music' in member.get('job', '') 
+                      and 'Composer' in member.get('job', '')] if isinstance(x, list) else []
         )
         
         return df
@@ -197,15 +166,21 @@ class CreditsDataCleaner:
         df = self.clean_crew_data(df)
         df = self.validate_ids(df)
         
-        # Create summary statistics
-        logger.info(f"Credits cleaning complete. Final dataset: {len(df)} records")
-        logger.info(f"Records with cast data: {df['has_cast_data'].sum()}")
-        logger.info(f"Records with crew data: {df['has_crew_data'].sum()}")
-        logger.info(f"Total unique actors extracted: {len(set([actor for actors in df['actor_names'] for actor in actors]))}")
-        logger.info(f"Average actors per movie: {df['num_cast_members'].mean():.2f}")
-        logger.info(f"Average crew members per movie: {df['num_crew_members'].mean():.2f}")
+        # Keep only recommendation-relevant columns
+        recommendation_columns = [
+            'id', 'actors', 'lead_actors', 'cast_size', 
+            'directors', 'producers', 'writers', 'composers'
+        ]
         
-        return df
+        # Filter to keep only useful columns
+        df_clean = df[recommendation_columns].copy()
+        
+        # Create summary statistics
+        logger.info(f"Credits cleaning complete. Final dataset: {len(df_clean)} records")
+        logger.info(f"Total unique actors extracted: {len(set([actor for actors in df_clean['actors'] for actor in actors]))}")
+        logger.info(f"Average actors per movie: {df_clean['cast_size'].mean():.2f}")
+        
+        return df_clean
 
 
 class KeywordsDataCleaner:
@@ -227,7 +202,7 @@ class KeywordsDataCleaner:
             raise
     
     def clean_keywords(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean and validate keywords data."""
+        """Clean and validate keywords data - keep only keyword names for recommendations."""
         logger.info("Cleaning keywords data")
         
         # Parse keywords JSON safely
@@ -235,19 +210,13 @@ class KeywordsDataCleaner:
             lambda x: self.validator.safe_json_parse(x, [])
         )
         
-        # Extract keyword metrics
-        df['num_keywords'] = df['keywords_parsed'].apply(lambda x: len(x) if isinstance(x, list) else 0)
-        df['has_keywords'] = df['keywords_parsed'].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)
-        
-        # Extract keyword names as list
-        df['keyword_names'] = df['keywords_parsed'].apply(
-            lambda x: [kw.get('name', '') for kw in x if isinstance(kw, dict) and kw.get('name')] if isinstance(x, list) else []
+        # Extract only keyword names (the most important part for content-based recommendations)
+        df['keywords'] = df['keywords_parsed'].apply(
+            lambda x: [kw.get('name', '').lower() for kw in x if isinstance(kw, dict) and kw.get('name')] if isinstance(x, list) else []
         )
         
-        # Create keyword string for text analysis
-        df['keywords_text'] = df['keyword_names'].apply(
-            lambda x: ', '.join(x) if x else ''
-        )
+        # Keyword count (useful feature)
+        df['keyword_count'] = df['keywords'].apply(len)
         
         return df
     
@@ -276,88 +245,16 @@ class KeywordsDataCleaner:
         df = self.clean_keywords(df)
         df = self.validate_ids(df)
         
-        # Create summary statistics
-        logger.info(f"Keywords cleaning complete. Final dataset: {len(df)} records")
-        logger.info(f"Records with keywords: {df['has_keywords'].sum()}")
-        logger.info(f"Average keywords per movie: {df['num_keywords'].mean():.2f}")
-        
-        return df
-
-
-class LinksDataCleaner:
-    """Cleaning pipeline for links.csv data."""
-    
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.validator = DataValidator()
-    
-    def load_data(self) -> pd.DataFrame:
-        """Load links data with proper error handling."""
-        logger.info(f"Loading links data from {self.file_path}")
-        try:
-            df = pd.read_csv(self.file_path)
-            logger.info(f"Loaded {len(df)} records from links.csv")
-            return df
-        except Exception as e:
-            logger.error(f"Error loading links data: {e}")
-            raise
-    
-    def clean_movie_ids(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean and validate movie ID mappings."""
-        logger.info("Cleaning movie ID mappings")
-        
-        # Convert all ID columns to numeric
-        id_columns = ['movieId', 'tmdbId']
-        for col in id_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Handle IMDB IDs (they have leading zeros and should be strings)
-        if 'imdbId' in df.columns:
-            df['imdbId'] = df['imdbId'].astype(str).str.zfill(7)  # Pad with zeros
-            df['imdbId_clean'] = 'tt' + df['imdbId']  # Standard IMDB format
-        
-        # Validate all IDs are present and valid
-        df['has_movieId'] = df['movieId'].notna() & (df['movieId'] > 0)
-        df['has_imdbId'] = df['imdbId'].notna() & (df['imdbId'] != '0000000')
-        df['has_tmdbId'] = df['tmdbId'].notna() & (df['tmdbId'] > 0)
-        
-        # Mark complete records
-        df['complete_mapping'] = df['has_movieId'] & df['has_imdbId'] & df['has_tmdbId']
-        
-        return df
-    
-    def detect_duplicates(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Detect and flag duplicate ID mappings."""
-        logger.info("Detecting duplicate mappings")
-        
-        # Check for duplicate movieIds
-        df['duplicate_movieId'] = df.duplicated(subset=['movieId'], keep=False)
-        
-        # Check for duplicate IMDb IDs
-        if 'imdbId' in df.columns:
-            df['duplicate_imdbId'] = df.duplicated(subset=['imdbId'], keep=False)
-        
-        # Check for duplicate TMDB IDs
-        if 'tmdbId' in df.columns:
-            df['duplicate_tmdbId'] = df.duplicated(subset=['tmdbId'], keep=False)
-        
-        return df
-    
-    def clean_data(self) -> pd.DataFrame:
-        """Execute full cleaning pipeline for links data."""
-        logger.info("Starting links data cleaning pipeline")
-        
-        df = self.load_data()
-        df = self.clean_movie_ids(df)
-        df = self.detect_duplicates(df)
+        # Keep only recommendation-relevant columns
+        recommendation_columns = ['id', 'keywords', 'keyword_count']
+        df_clean = df[recommendation_columns].copy()
         
         # Create summary statistics
-        complete_mappings = df['complete_mapping'].sum()
-        logger.info(f"Links cleaning complete. Final dataset: {len(df)} records")
-        logger.info(f"Complete mappings: {complete_mappings} ({complete_mappings/len(df)*100:.1f}%)")
+        logger.info(f"Keywords cleaning complete. Final dataset: {len(df_clean)} records")
+        logger.info(f"Average keywords per movie: {df_clean['keyword_count'].mean():.2f}")
         
-        return df
+        return df_clean
+
 
 
 class MoviesMetadataCleaner:
@@ -428,80 +325,67 @@ class MoviesMetadataCleaner:
         return df
     
     def clean_json_fields(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean JSON fields like genres, production_companies, etc."""
+        """Clean JSON fields - keep only recommendation-relevant data."""
         logger.info("Cleaning JSON fields")
         
-        json_fields = ['genres', 'production_companies', 'production_countries', 
-                      'spoken_languages', 'belongs_to_collection']
+        # Only process genres (most important for recommendations)
+        if 'genres' in df.columns:
+            df['genres_parsed'] = df['genres'].apply(
+                lambda x: self.validator.safe_json_parse(x, [])
+            )
+            df['genres'] = df['genres_parsed'].apply(
+                lambda x: [g.get('name', '') for g in x if isinstance(g, dict)] if isinstance(x, list) else []
+            )
+            df['genre_count'] = df['genres'].apply(len)
+            df['primary_genre'] = df['genres'].apply(lambda x: x[0] if x else None)
+        else:
+            df['genres'] = [[] for _ in range(len(df))]
+            df['genre_count'] = 0
+            df['primary_genre'] = None
         
-        for field in json_fields:
-            if field in df.columns:
-                # Parse JSON safely
-                df[f'{field}_parsed'] = df[field].apply(
-                    lambda x: self.validator.safe_json_parse(x, [])
-                )
-                # Extract names/values from parsed data
-                if field == 'genres':
-                    df['genre_names'] = df[f'{field}_parsed'].apply(
-                        lambda x: [g.get('name', '') for g in x if isinstance(g, dict)] if isinstance(x, list) else []
-                    )
-                    df['num_genres'] = df['genre_names'].apply(len)
-                    df['primary_genre'] = df['genre_names'].apply(lambda x: x[0] if x else None)
-                elif field == 'production_companies':
-                    df['production_company_names'] = df[f'{field}_parsed'].apply(
-                        lambda x: [c.get('name', '') for c in x if isinstance(c, dict)] if isinstance(x, list) else []
-                    )
-                    df['num_production_companies'] = df['production_company_names'].apply(len)
-                elif field == 'production_countries':
-                    df['production_country_codes'] = df[f'{field}_parsed'].apply(
-                        lambda x: [c.get('iso_3166_1', '') for c in x if isinstance(c, dict)] if isinstance(x, list) else []
-                    )
-                    df['num_production_countries'] = df['production_country_codes'].apply(len)
-                elif field == 'spoken_languages':
-                    df['spoken_language_codes'] = df[f'{field}_parsed'].apply(
-                        lambda x: [l.get('iso_639_1', '') for l in x if isinstance(l, dict)] if isinstance(x, list) else []
-                    )
-                    df['num_spoken_languages'] = df['spoken_language_codes'].apply(len)
-            else:
-                # If field is missing, add empty/NaN columns for all expected derived columns
-                df[f'{field}_parsed'] = [[] for _ in range(len(df))]
-                if field == 'genres':
-                    df['genre_names'] = [[] for _ in range(len(df))]
-                    df['num_genres'] = np.nan
-                    df['primary_genre'] = np.nan
-                elif field == 'production_companies':
-                    df['production_company_names'] = [[] for _ in range(len(df))]
-                    df['num_production_companies'] = np.nan
-                elif field == 'production_countries':
-                    df['production_country_codes'] = [[] for _ in range(len(df))]
-                    df['num_production_countries'] = np.nan
-                elif field == 'spoken_languages':
-                    df['spoken_language_codes'] = [[] for _ in range(len(df))]
-                    df['num_spoken_languages'] = np.nan
+        # Production companies (can be useful for studio-based recommendations)
+        if 'production_companies' in df.columns:
+            df['production_companies_parsed'] = df['production_companies'].apply(
+                lambda x: self.validator.safe_json_parse(x, [])
+            )
+            df['production_companies'] = df['production_companies_parsed'].apply(
+                lambda x: [c.get('name', '') for c in x if isinstance(c, dict)] if isinstance(x, list) else []
+            )
+            df['main_studio'] = df['production_companies'].apply(lambda x: x[0] if x else None)
+        else:
+            df['production_companies'] = [[] for _ in range(len(df))]
+            df['main_studio'] = None
+        
+        # Collections (useful for franchise-based recommendations)
+        if 'belongs_to_collection' in df.columns:
+            df['collection_parsed'] = df['belongs_to_collection'].apply(
+                lambda x: self.validator.safe_json_parse(x, None)
+            )
+            df['collection_name'] = df['collection_parsed'].apply(
+                lambda x: x.get('name', '') if isinstance(x, dict) else ''
+            )
+            df['is_part_of_collection'] = df['collection_name'] != ''
+        else:
+            df['collection_name'] = ''
+            df['is_part_of_collection'] = False
         
         return df
     
     def clean_categorical_fields(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean categorical fields."""
+        """Clean categorical fields - keep only recommendation-relevant ones."""
         logger.info("Cleaning categorical fields")
         
-        # Clean adult field
+        # Clean adult field (important for content filtering in recommendations)
         if 'adult' in df.columns:
             df['adult'] = df['adult'].map({'False': False, 'True': True, False: False, True: True})
             df['adult'] = df['adult'].fillna(False).astype(bool)
         else:
             df['adult'] = False
-        # Clean video field
-        if 'video' in df.columns:
-            df['video'] = df['video'].map({'False': False, 'True': True, False: False, True: True})
-            df['video'] = df['video'].fillna(False).astype(bool)
-        else:
-            df['video'] = False
-        # Clean language codes
+            
+        # Clean language codes (important for recommendations)
         if 'original_language' in df.columns:
             df['original_language'] = df['original_language'].str.lower().str.strip()
             df['is_english'] = df['original_language'] == 'en'
-
         else:
             df['original_language'] = np.nan
             df['is_english'] = False
@@ -530,14 +414,30 @@ class MoviesMetadataCleaner:
         df = self.clean_categorical_fields(df)
         df = self.validate_ids(df)
         
-        # Create summary statistics
-        logger.info(f"Movies metadata cleaning complete. Final dataset: {len(df)} records")
-        if 'release_date_valid' in df.columns:
-            logger.info(f"Records with valid release dates: {df['release_date_valid'].sum()}")
-        if 'budget_valid' in df.columns:
-            logger.info(f"Records with valid budgets: {df['budget_valid'].sum()}")
+        # Keep only recommendation-relevant columns
+        recommendation_columns = [
+            'id', 'title', 'original_title', 'overview',
+            'genres', 'genre_count', 'primary_genre',
+            'production_companies', 'main_studio', 
+            'collection_name', 'is_part_of_collection',
+            'release_date', 'release_year', 'release_decade',
+            'budget', 'revenue', 'runtime', 
+            'original_language', 'is_english', 'adult',
+            'vote_average', 'vote_count', 'popularity'
+        ]
         
-        return df
+        # Filter to keep only useful columns that exist in the dataframe
+        available_columns = [col for col in recommendation_columns if col in df.columns]
+        df_clean = df[available_columns].copy()
+        
+        # Create summary statistics
+        logger.info(f"Movies metadata cleaning complete. Final dataset: {len(df_clean)} records")
+        if 'release_date' in df_clean.columns:
+            logger.info(f"Records with valid release dates: {df_clean['release_date'].notna().sum()}")
+        if 'budget' in df_clean.columns:
+            logger.info(f"Records with valid budgets: {(df_clean['budget'] > 0).sum()}")
+        
+        return df_clean
 
 
 class RatingsDataCleaner:
@@ -602,45 +502,35 @@ class RatingsDataCleaner:
         return df
     
     def clean_timestamps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean and validate timestamps."""
+        """Clean and validate timestamps - keep simple for recommendations."""
         logger.info("Cleaning timestamps")
         
         # Convert to numeric first
         df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
         
-        # Convert to datetime
+        # Convert to datetime for basic validation
         df['rating_datetime'] = pd.to_datetime(df['timestamp'], unit='s', errors='coerce')
         
         # Validate reasonable date range
         current_year = datetime.now().year
-        df['timestamp_valid'] = (
+        df['valid_timestamp'] = (
             df['rating_datetime'].notna() & 
             (df['rating_datetime'].dt.year <= current_year)
         )
         
-        # Extract useful date components
+        # Keep only the year for temporal recommendations
         df['rating_year'] = df['rating_datetime'].dt.year
-        df['rating_month'] = df['rating_datetime'].dt.month
-        df['rating_weekday'] = df['rating_datetime'].dt.dayofweek
         
         return df
     
     def detect_anomalies(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Detect potential anomalies in rating patterns."""
-        logger.info("Detecting rating anomalies")
+        """Detect basic anomalies - simplified for recommendation system."""
+        logger.info("Detecting basic rating anomalies")
         
-        # Check for users with excessive rating counts (potential bots)
-        user_rating_counts = df.groupby('userId')['rating'].count()
-        excessive_threshold = user_rating_counts.quantile(0.99)  # Top 1%
-        
-        df['user_excessive_ratings'] = df['userId'].map(
-            user_rating_counts > excessive_threshold
-        ).fillna(False)
-        
-        # Check for movies with very few ratings
+        # Check for movies with very few ratings (less useful for recommendations)
         movie_rating_counts = df.groupby('movieId')['rating'].count()
         df['movie_rating_count'] = df['movieId'].map(movie_rating_counts)
-        df['movie_few_ratings'] = df['movie_rating_count'] < 5
+        df['reliable_movie'] = df['movie_rating_count'] >= 5  # At least 5 ratings
         
         return df
     
@@ -655,57 +545,63 @@ class RatingsDataCleaner:
         df = self.clean_timestamps(df)
         df = self.detect_anomalies(df)
         
-        # Create data quality summary
+        # Keep only essential recommendation columns
+        recommendation_columns = [
+            'userId', 'movieId', 'rating', 'rating_year', 
+            'movie_rating_count', 'reliable_movie'
+        ]
+        
+        # Filter to valid records and useful columns
         valid_records = (
             df['rating_valid'] & 
             df['userId_valid'] & 
             df['movieId_valid'] & 
-            df['timestamp_valid']
+            df['valid_timestamp']
         )
         
-        logger.info(f"Ratings cleaning complete. Final dataset: {len(df)} records")
-        logger.info(f"Completely valid records: {valid_records.sum()} ({valid_records.mean()*100:.1f}%)")
-        logger.info(f"Unique users: {df['userId'].nunique()}")
-        logger.info(f"Unique movies: {df['movieId'].nunique()}")
+        df_clean = df[valid_records][recommendation_columns].copy()
         
-        return df
+        logger.info(f"Ratings cleaning complete. Final dataset: {len(df_clean)} records")
+        logger.info(f"Unique users: {df_clean['userId'].nunique()}")
+        logger.info(f"Unique movies: {df_clean['movieId'].nunique()}")
+        logger.info(f"Reliable movies (5+ ratings): {df_clean['reliable_movie'].sum()}")
+        
+        return df_clean
 
 
 # Main execution functions
 def clean_all_datasets(data_dir: str = './data') -> Dict[str, pd.DataFrame]:
     """
-    Execute all cleaning pipelines and return cleaned datasets.
+    Execute all cleaning pipelines and return cleaned datasets optimized for movie recommendations.
     
     Args:
         data_dir: Directory containing the CSV files
         
     Returns:
-        Dictionary of cleaned DataFrames
+        Dictionary of cleaned DataFrames containing only recommendation-relevant data
     """
     import os
     
     cleaned_data = {}
     
-    # Define file paths
+    # Define file paths - only include files useful for recommendations
     files = {
         'credits': os.path.join(data_dir, 'credits.csv'),
         'keywords': os.path.join(data_dir, 'keywords.csv'),
-        'links': os.path.join(data_dir, 'links.csv'),
         'movies_metadata': os.path.join(data_dir, 'movies_metadata.csv'),
-        'ratings': os.path.join(data_dir, 'ratings_small.csv')
+        'ratings': os.path.join(data_dir, 'ratings.csv')  # Use small file for faster processing
     }
     
     # Execute cleaning pipelines
     try:
-        logger.info("Starting comprehensive data cleaning process")
+        logger.info("Starting recommendation-focused data cleaning process")
         
-        # cleaned_data['credits'] = CreditsDataCleaner(files['credits']).clean_data()
-        # cleaned_data['keywords'] = KeywordsDataCleaner(files['keywords']).clean_data()
-        # cleaned_data['links'] = LinksDataCleaner(files['links']).clean_data()
+        cleaned_data['credits'] = CreditsDataCleaner(files['credits']).clean_data()
+        cleaned_data['keywords'] = KeywordsDataCleaner(files['keywords']).clean_data()
         cleaned_data['movies_metadata'] = MoviesMetadataCleaner(files['movies_metadata']).clean_data()
-        # cleaned_data['ratings'] = RatingsDataCleaner(files['ratings']).clean_data()
+        cleaned_data['ratings'] = RatingsDataCleaner(files['ratings']).clean_data()
         
-        logger.info("All datasets cleaned successfully!")
+        logger.info("All recommendation datasets cleaned successfully!")
         
     except Exception as e:
         logger.error(f"Error in cleaning process: {e}")
