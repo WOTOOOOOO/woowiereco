@@ -10,14 +10,14 @@ import pandas as pd
 import numpy as np
 from sklearn.naive_bayes import GaussianNB, CategoricalNB
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler, KBinsDiscretizer
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score
-from sklearn.ensemble import VotingRegressor
 from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.inspection import permutation_importance
 import ast
 import re
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -31,6 +31,7 @@ class NaiveBayesMovieRecommenderConfig:
     CREDITS_FILE = "credits_cleaned.csv"
     KEYWORDS_FILE = "keywords_cleaned.csv"
     RATINGS_FILE = "ratings_cleaned.csv"
+    LINKS_FILE = "links.csv"
     
     # Model parameters
     RANDOM_STATE = 42
@@ -38,8 +39,8 @@ class NaiveBayesMovieRecommenderConfig:
     ALPHA = 1.0           # Categorical NB smoothing parameter
     
     # Feature engineering parameters
-    MIN_MOVIE_RATINGS = 10  # Minimum ratings for a movie to be considered
-    MIN_USER_RATINGS = 20   # Minimum ratings for a user to be considered
+    MIN_MOVIE_RATINGS = 5  # Minimum ratings for a movie to be considered
+    MIN_USER_RATINGS = 10   # Minimum ratings for a user to be considered
     MAX_USERS = 5000        # Maximum number of users to consider (for performance)
     MAX_ACTORS = 5          # Maximum number of lead actors to consider
     MAX_KEYWORDS = 10       # Maximum number of keywords to consider
@@ -50,13 +51,6 @@ class NaiveBayesMovieRecommenderConfig:
     MAX_TOP_DIRECTORS = 10  # Most frequent directors to include as features
     MAX_TOP_GENRES = 15     # Most frequent genres to include as features
     MAX_KEYWORD_FEATURES = 25  # Maximum keyword features from vectorization
-    
-    # Binning parameters for continuous variables
-    N_RATING_BINS = 5       # Number of bins for rating discretization
-    N_YEAR_BINS = 8         # Number of bins for release year
-    N_RUNTIME_BINS = 6      # Number of bins for runtime
-    N_BUDGET_BINS = 5       # Number of bins for budget
-    N_POPULARITY_BINS = 5   # Number of bins for popularity
     
     # Model evaluation parameters
     TEST_SIZE = 0.2
@@ -86,17 +80,18 @@ class NaiveBayesDataProcessor:
         self.scaler = StandardScaler()
         self.discretizers = {}
         
-    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Load all cleaned movie data files from the specified directory.
         
         Returns:
-            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: 
-                A tuple containing (movies, credits, keywords, ratings) DataFrames
+            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: 
+                A tuple containing (movies, credits, keywords, ratings, links) DataFrames
                 - movies: Movie metadata including titles, genres, budgets, revenues
                 - credits: Cast and crew information for each movie
                 - keywords: Movie keywords and themes
                 - ratings: User ratings with timestamps
+                - links: Mapping between MovieLens IDs and TMDb IDs
         
         Raises:
             FileNotFoundError: If any of the required data files are missing
@@ -108,9 +103,10 @@ class NaiveBayesDataProcessor:
         credits = pd.read_csv(f"{self.config.DATA_PATH}{self.config.CREDITS_FILE}")
         keywords = pd.read_csv(f"{self.config.DATA_PATH}{self.config.KEYWORDS_FILE}")
         ratings = pd.read_csv(f"{self.config.DATA_PATH}{self.config.RATINGS_FILE}")
+        links = pd.read_csv(f"{self.config.DATA_PATH}{self.config.LINKS_FILE}")
         
-        print(f"Loaded: {len(movies)} movies, {len(credits)} credits, {len(keywords)} keywords, {len(ratings)} ratings")
-        return movies, credits, keywords, ratings
+        print(f"Loaded: {len(movies)} movies, {len(credits)} credits, {len(keywords)} keywords, {len(ratings)} ratings, {len(links)} links")
+        return movies, credits, keywords, ratings, links
     
     def filter_reliable_data(self, ratings: pd.DataFrame) -> pd.DataFrame:
         """
@@ -179,17 +175,19 @@ class NaiveBayesDataProcessor:
         return series.apply(safe_parse)
     
     def merge_datasets(self, movies: pd.DataFrame, credits: pd.DataFrame, 
-                      keywords: pd.DataFrame, ratings: pd.DataFrame) -> pd.DataFrame:
+                      keywords: pd.DataFrame, ratings: pd.DataFrame, links: pd.DataFrame) -> pd.DataFrame:
         """
-        Merge all datasets into a single DataFrame for analysis.
+        Merge all datasets into a single DataFrame for analysis using links to bridge IDs.
         
-        Combines ratings with movie metadata, credits, and keywords based on movieId.
+        Combines ratings with movie metadata, credits, and keywords using the links table
+        to resolve the mismatch between MovieLens IDs (ratings) and TMDb IDs (metadata).
         
         Args:
             movies (pd.DataFrame): Movie metadata
             credits (pd.DataFrame): Cast and crew information
             keywords (pd.DataFrame): Movie keywords
             ratings (pd.DataFrame): User ratings (filtered)
+            links (pd.DataFrame): Mapping between MovieLens IDs and TMDb IDs
             
         Returns:
             pd.DataFrame: Merged DataFrame containing all features
@@ -199,17 +197,29 @@ class NaiveBayesDataProcessor:
         # Start with ratings as base
         merged = ratings.copy()
         
-        # Merge with movies
-        merged = merged.merge(movies, left_on='movieId', right_on='id', how='left')
+        # Merge ratings (movieId) with links (movieId) to get tmdbId
+        merged = merged.merge(links[['movieId', 'tmdbId']], on='movieId', how='left')
         
-        # Merge with credits
+        # Drop rows where tmdbId is missing (cannot link to metadata)
+        initial_count = len(merged)
+        merged = merged.dropna(subset=['tmdbId'])
+        if len(merged) < initial_count:
+            print(f"Dropped {initial_count - len(merged)} ratings with no valid link to TMDb ID")
+        
+        # Ensure tmdbId is integer for merging
+        merged['tmdbId'] = merged['tmdbId'].astype(int)
+        
+        # Merge with movies using tmdbId -> id
+        merged = merged.merge(movies, left_on='tmdbId', right_on='id', how='left')
+        
+        # Merge with credits using tmdbId -> id
         if self.config.USE_ACTORS or self.config.USE_DIRECTORS:
             merged = merged.merge(credits[['id', 'lead_actors', 'directors', 'cast_size']], 
-                                left_on='movieId', right_on='id', how='left', suffixes=('', '_credits'))
+                                left_on='tmdbId', right_on='id', how='left', suffixes=('', '_credits'))
         
-        # Merge with keywords
+        # Merge with keywords using tmdbId -> id
         if self.config.USE_KEYWORDS:
-            merged = merged.merge(keywords, left_on='movieId', right_on='id', how='left', suffixes=('', '_keywords'))
+            merged = merged.merge(keywords, left_on='tmdbId', right_on='id', how='left', suffixes=('', '_keywords'))
         
         # Filter movies by release year (only movies after MIN_RELEASE_YEAR)
         print(f"Filtering movies released after {self.config.MIN_RELEASE_YEAR}...")
@@ -228,7 +238,6 @@ class NaiveBayesDataProcessor:
         Processes genre information to create:
         1. Binary features for top genres
         2. Primary genre categorical feature
-        3. Binned genre count feature
         
         Args:
             df (pd.DataFrame): Input DataFrame with 'genres' column
@@ -264,11 +273,8 @@ class NaiveBayesDataProcessor:
         # Primary genre as categorical feature
         df['primary_genre_clean'] = df['primary_genre'].fillna('Unknown')
         
-        # Genre count binning for categorical treatment
+        # Genre count for categorical treatment
         df['genre_count_filled'] = df['genre_count'].fillna(0)
-        df['genre_count_binned'] = pd.cut(df['genre_count_filled'], 
-                                        bins=[-1, 0, 1, 2, 3, np.inf], 
-                                        labels=['None', 'One', 'Two', 'Three', 'Many'])
         
         return df
     
@@ -279,7 +285,6 @@ class NaiveBayesDataProcessor:
         Processes cast and crew information to create:
         1. Binary features for top actors
         2. Binary features for top directors
-        3. Binned cast size feature
         
         Args:
             df (pd.DataFrame): Input DataFrame with 'lead_actors' and 'directors' columns
@@ -336,11 +341,8 @@ class NaiveBayesDataProcessor:
                     lambda x: 1 if isinstance(x, list) and director in x else 0
                 )
         
-        # Cast size binning
+        # Cast size (used as continuous feature)
         df['cast_size_filled'] = df['cast_size'].fillna(0)
-        df['cast_size_binned'] = pd.cut(df['cast_size_filled'], 
-                                      bins=[-1, 0, 5, 15, 30, np.inf], 
-                                      labels=['None', 'Small', 'Medium', 'Large', 'Very Large'])
         
         return df
     
@@ -349,7 +351,6 @@ class NaiveBayesDataProcessor:
         Create keyword-based features using binary encoding for categories.
         
         Uses CountVectorizer to create binary features for the most frequent keywords.
-        Also creates a binned feature for the number of keywords per movie.
         
         Args:
             df (pd.DataFrame): Input DataFrame with 'keywords' column
@@ -371,7 +372,8 @@ class NaiveBayesDataProcessor:
         )
         
         # Use CountVectorizer for binary features (better for Naive Bayes than TF-IDF)
-        vectorizer = CountVectorizer(max_features=self.config.MAX_KEYWORD_FEATURES, 
+        max_features = self.config.MAX_KEYWORD_FEATURES
+        vectorizer = CountVectorizer(max_features=max_features, 
                                    binary=True, stop_words='english')
         keyword_matrix = vectorizer.fit_transform(df['keywords_text'])
         
@@ -385,27 +387,25 @@ class NaiveBayesDataProcessor:
         # Merge with main DataFrame
         df = pd.concat([df, keyword_features], axis=1)
         
-        # Keyword count binning
+        # Keyword count
         df['keyword_count_filled'] = df['keyword_count'].fillna(0)
-        df['keyword_count_binned'] = pd.cut(df['keyword_count_filled'], 
-                                          bins=[-1, 0, 2, 5, 10, np.inf], 
-                                          labels=['None', 'Few', 'Some', 'Many', 'Lots'])
         
         return df
     
     def create_discretized_movie_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Create discretized movie-specific features for Naive Bayes.
+        Create movie-specific features for Naive Bayes.
         
-        Discretizes continuous variables into bins to make them suitable for 
-        Categorical Naive Bayes or to improve Gaussian Naive Bayes performance.
-        Features processed: release_year, runtime, budget, popularity, vote_average, vote_count.
+        Processes continuous variables to make them suitable for 
+        Gaussian Naive Bayes performance (imputation, log-transform).
+        Features processed: release_year, runtime, budget, revenue, profit, roi,
+        popularity, vote_average, vote_count, movie_age, original_language, adult.
         
         Args:
             df (pd.DataFrame): Input DataFrame with movie metadata
             
         Returns:
-            pd.DataFrame: DataFrame with added discretized features
+            pd.DataFrame: DataFrame with added features
         """
         if not self.config.USE_MOVIE_FEATURES:
             return df
@@ -421,67 +421,28 @@ class NaiveBayesDataProcessor:
         df['vote_count_filled'] = df['vote_count'].fillna(0)
         df['popularity_filled'] = df['popularity'].fillna(df['popularity'].median())
         
-        # Discretize continuous features
-        # Release year bins
-        year_bins = np.linspace(df['release_year_filled'].min(), 
-                               df['release_year_filled'].max(), 
-                               self.config.N_YEAR_BINS + 1)
-        df['release_year_binned'] = pd.cut(df['release_year_filled'], bins=year_bins, 
-                                         include_lowest=True)
-        
-        # Runtime bins
-        df['runtime_binned'] = pd.cut(df['runtime_filled'], 
-                                    bins=self.config.N_RUNTIME_BINS,
-                                    labels=[f'Runtime_{i}' for i in range(self.config.N_RUNTIME_BINS)])
+        # Continuous features
         
         # Budget bins (log scale for better distribution)
         df['budget_log'] = np.log1p(df['budget_filled'])
-        df['budget_binned'] = pd.cut(df['budget_log'], 
-                                   bins=self.config.N_BUDGET_BINS,
-                                   labels=[f'Budget_{i}' for i in range(self.config.N_BUDGET_BINS)])
         
         # Revenue bins (log scale)
         df['revenue_log'] = np.log1p(df['revenue_filled'])
-        df['revenue_binned'] = pd.cut(df['revenue_log'], 
-                                    bins=self.config.N_BUDGET_BINS, # Reuse budget bins count
-                                    labels=[f'Revenue_{i}' for i in range(self.config.N_BUDGET_BINS)])
 
         # Profit and ROI
         df['profit'] = df['revenue_filled'] - df['budget_filled']
         df['profit_log'] = np.log1p(np.maximum(df['profit'], 0))
-        df['profit_binned'] = pd.cut(df['profit_log'], 
-                                   bins=5,
-                                   labels=[f'Profit_{i}' for i in range(5)])
         
         df['roi'] = np.where(df['budget_filled'] > 0, 
                            df['profit'] / df['budget_filled'], 0)
         # Handle infinite ROI if any
         df['roi'] = df['roi'].replace([np.inf, -np.inf], 0)
-        df['roi_binned'] = pd.cut(df['roi'], 
-                                bins=[-np.inf, 0, 1, 2, 5, np.inf],
-                                labels=['Loss', 'Low', 'Medium', 'High', 'Very_High'])
-        
-        # Popularity bins
-        df['popularity_binned'] = pd.cut(df['popularity_filled'], 
-                                       bins=self.config.N_POPULARITY_BINS,
-                                       labels=[f'Popularity_{i}' for i in range(self.config.N_POPULARITY_BINS)])
-        
-        # Vote average bins (for movie quality)
-        df['vote_average_binned'] = pd.cut(df['vote_average_filled'], 
-                                         bins=[0, 4, 6, 7, 8, 10],
-                                         labels=['Poor', 'Below_Avg', 'Good', 'Very_Good', 'Excellent'])
         
         # Vote count bins (for popularity/reliability)
         df['vote_count_log'] = np.log1p(df['vote_count_filled'])
-        df['vote_count_binned'] = pd.cut(df['vote_count_log'], 
-                                       bins=5,
-                                       labels=[f'VoteCount_{i}' for i in range(5)])
         
         # Movie age
         df['movie_age'] = 2025 - df['release_year_filled']
-        df['movie_age_binned'] = pd.cut(df['movie_age'], 
-                                      bins=[0, 5, 10, 20, 30, np.inf],
-                                      labels=['Recent', 'New', 'Decade_Old', 'Classic', 'Very_Old'])
         
         # Language categories
         df['original_language_clean'] = df['original_language'].fillna('unknown')
@@ -495,9 +456,9 @@ class NaiveBayesDataProcessor:
         """
         Create user-specific features based on rating history.
         
-        Calculates and bins user statistics:
-        - Average rating (binned)
-        - Rating count (binned)
+        Calculates user statistics:
+        - Average rating
+        - Rating count
         - Activity span
         
         Args:
@@ -528,15 +489,6 @@ class NaiveBayesDataProcessor:
         # Fill NaN std with 0 (users with only one rating)
         user_stats['user_rating_std'] = user_stats['user_rating_std'].fillna(0)
         
-        # Discretize user features
-        user_stats['user_avg_rating_binned'] = pd.cut(user_stats['user_avg_rating'], 
-                                                     bins=self.config.N_RATING_BINS,
-                                                     labels=[f'AvgRating_{i}' for i in range(self.config.N_RATING_BINS)])
-        
-        user_stats['user_rating_count_binned'] = pd.cut(user_stats['user_rating_count'], 
-                                                       bins=5,
-                                                       labels=['Low_Activity', 'Moderate', 'Active', 'Very_Active', 'Power_User'])
-        
         # Merge with main DataFrame
         df = df.merge(user_stats, on='userId', how='left')
         
@@ -546,11 +498,8 @@ class NaiveBayesDataProcessor:
         """
         Create temporal features from rating timestamps.
         
-        Extracts and bins temporal information:
-        - Day of week
-        - Month
-        - Time of day (Morning, Afternoon, Evening, Night)
-        - Is weekend
+        Extracts temporal information:
+        - Time gap between movie release and rating
         
         Args:
             df (pd.DataFrame): Input DataFrame with 'timestamp' column
@@ -564,15 +513,10 @@ class NaiveBayesDataProcessor:
         print("Creating temporal features...")
         
         # Rating year binning
-        df['rating_year_binned'] = pd.cut(df['rating_year'], 
-                                        bins=[2000, 2005, 2010, 2015, 2020, 2025],
-                                        labels=['Early_2000s', 'Mid_2000s', 'Early_2010s', 'Mid_2010s', 'Recent'])
+        # (Binning removed)
         
         # Time gap between movie release and rating
         df['rating_delay'] = df['rating_year'] - df['release_year_filled']
-        df['rating_delay_binned'] = pd.cut(df['rating_delay'], 
-                                         bins=[-np.inf, 0, 1, 5, 10, np.inf],
-                                         labels=['Before_Release', 'Same_Year', 'Recent', 'Years_Later', 'Much_Later'])
         
         return df
 
@@ -610,12 +554,24 @@ class HybridNaiveBayesRegressor(BaseEstimator, RegressorMixin):
         
         # Features for Gaussian NB (continuous/ordinal features)
         gaussian_features = []
+        # Keywords that identify continuous/numeric features
+        continuous_keywords = [
+            'avg', 'std', 'count', 'span', 'age', 'size', 'log', 
+            'year', 'delay', 'runtime', 'revenue', 'budget', 
+            'roi', 'profit', 'popularity', 'filled'
+        ]
+        
         for col in X.columns:
-            # Skip categorical columns even if they contain keywords like 'age' (e.g. 'keyword_marriage')
+            # Skip categorical columns even if they contain keywords
             if any(col.startswith(prefix) for prefix in ['genre_', 'actor_', 'director_', 'keyword_']):
                 continue
-                
-            if any(keyword in col.lower() for keyword in ['avg', 'std', 'count', 'span', 'age', 'size', 'log']):
+            
+            # Check for explicitly categorical columns not covered by prefixes
+            if 'clean' in col and 'encoded' not in col and X[col].dtype == 'object':
+                 continue
+                 
+            # Include if it matches continuous keywords OR is explicitly numeric and not categorical
+            if any(keyword in col.lower() for keyword in continuous_keywords):
                 if X[col].dtype in ['int64', 'float64']:
                     gaussian_features.append(col)
         
@@ -705,9 +661,9 @@ class HybridNaiveBayesRegressor(BaseEstimator, RegressorMixin):
         """
         Predict ratings by combining Gaussian and Categorical NB predictions.
         
-        1. Gets class probabilities from both models
-        2. Averages the probabilities (ensemble)
-        3. Converts combined probabilities to continuous ratings using expected value
+        1. Gets class log-probabilities from both models
+        2. Sums the log-probabilities (equivalent to multiplying probabilities)
+        3. Selects the class with the highest combined log-probability
         
         Args:
             X (pd.DataFrame): Features to predict on
@@ -724,28 +680,29 @@ class HybridNaiveBayesRegressor(BaseEstimator, RegressorMixin):
         has_categorical = X_categorical.shape[1] > 0
         
         if has_gaussian:
-            gaussian_proba = self.gaussian_nb.predict_proba(X_gaussian)
+            # Use log_proba for numerical stability and correct multiplication
+            # P(A and B) = P(A) * P(B) => log(P(A and B)) = log(P(A)) + log(P(B))
+            gaussian_log_proba = self.gaussian_nb.predict_log_proba(X_gaussian)
         
         if has_categorical:
             X_categorical = X_categorical.astype(int)
-            categorical_proba = self.categorical_nb.predict_proba(X_categorical)
+            categorical_log_proba = self.categorical_nb.predict_log_proba(X_categorical)
         
-        # Combine probabilities
+        # Combine log probabilities (equivalent to multiplication)
         if has_gaussian and has_categorical:
-            combined_proba = (gaussian_proba + categorical_proba) / 2
+            combined_log_proba = gaussian_log_proba + categorical_log_proba
         elif has_gaussian:
-            combined_proba = gaussian_proba
+            combined_log_proba = gaussian_log_proba
         elif has_categorical:
-            combined_proba = categorical_proba
+            combined_log_proba = categorical_log_proba
         else:
             # Fallback if no features (shouldn't happen)
-            combined_proba = np.ones((len(X), n_classes)) / n_classes
+            combined_log_proba = np.zeros((len(X), n_classes))
         
         # Convert probabilities back to ratings
-        # Use argmax (most likely class) instead of expected value
-        # This avoids "averaging out" to the mean and allows predicting extreme values (1.0 or 5.0)
+        # Use argmax (most likely class)
         rating_values = self.rating_encoder.classes_
-        most_likely_indices = np.argmax(combined_proba, axis=1)
+        most_likely_indices = np.argmax(combined_log_proba, axis=1)
         predicted_ratings = rating_values[most_likely_indices]
         
         return predicted_ratings
@@ -788,16 +745,13 @@ class NaiveBayesMovieRecommender:
         # Basic movie features (discretized and continuous)
         if self.config.USE_MOVIE_FEATURES:
             basic_features = [
-                'release_year_binned', 'runtime_binned', 'budget_binned', 
-                'revenue_binned', 'profit_binned', 'roi_binned',
-                'popularity_binned', 'vote_average_binned', 'vote_count_binned',
-                'movie_age_binned', 'original_language_clean', 'adult_clean',
-                'primary_genre_clean',
+                # Categorical features (to be encoded)
+                'original_language_clean', 'adult_clean', 'primary_genre_clean',
+                
                 # Continuous features for Gaussian NB
-                'release_year_filled', 'runtime_filled', 'budget_filled',
-                'revenue_filled', 'profit', 'roi',
-                'popularity_filled', 'vote_average_filled', 'vote_count_filled',
-                'budget_log', 'revenue_log', 'profit_log', 'vote_count_log'
+                'budget_log', 'revenue_log', 'profit_log', 'vote_count_log',
+                'release_year_filled', 'runtime_filled', 'roi',
+                'popularity_filled', 'vote_average_filled', 'movie_age'
             ]
             # Convert categorical columns to category codes for NB
             for col in basic_features:
@@ -812,7 +766,7 @@ class NaiveBayesMovieRecommender:
         if self.config.USE_USER_FEATURES:
             user_features = [
                 'user_avg_rating', 'user_rating_std', 'user_rating_count',
-                'user_activity_span', 'user_avg_rating_binned', 'user_rating_count_binned'
+                'user_activity_span'
             ]
             for col in user_features:
                 if col in df.columns:
@@ -829,10 +783,6 @@ class NaiveBayesMovieRecommender:
                            and not col.endswith('_list')]
             feature_columns.extend(cast_features)
             
-            if 'cast_size_binned' in df.columns:
-                df['cast_size_binned_encoded'] = pd.Categorical(df['cast_size_binned']).codes
-                feature_columns.append('cast_size_binned_encoded')
-            
             # Add continuous cast size for Gaussian NB
             if 'cast_size_filled' in df.columns:
                 feature_columns.append('cast_size_filled')
@@ -845,13 +795,6 @@ class NaiveBayesMovieRecommender:
                             and not col.endswith('_list')]
             feature_columns.extend(genre_features)
             
-            if 'genre_count_binned' in df.columns:
-                df['genre_count_binned_encoded'] = pd.Categorical(df['genre_count_binned']).codes
-                feature_columns.append('genre_count_binned_encoded')
-            
-            # Add continuous genre count for Gaussian NB
-            if 'genre_count_filled' in df.columns:
-                feature_columns.append('genre_count_filled')
         
         # Keyword features
         if self.config.USE_KEYWORDS:
@@ -862,21 +805,14 @@ class NaiveBayesMovieRecommender:
                               and not col.endswith('_text')]
             feature_columns.extend(keyword_features)
             
-            if 'keyword_count_binned' in df.columns:
-                df['keyword_count_binned_encoded'] = pd.Categorical(df['keyword_count_binned']).codes
-                feature_columns.append('keyword_count_binned_encoded')
-            
-            # Add continuous keyword count for Gaussian NB
-            if 'keyword_count_filled' in df.columns:
-                feature_columns.append('keyword_count_filled')
         
         # Temporal features
         if self.config.USE_TEMPORAL_FEATURES:
-            temporal_features = ['rating_year_binned', 'rating_delay_binned']
+            # Use continuous temporal features to match Random Forest
+            temporal_features = ['rating_year', 'rating_delay']
             for col in temporal_features:
                 if col in df.columns:
-                    df[f'{col}_encoded'] = pd.Categorical(df[col]).codes
-                    feature_columns.append(f'{col}_encoded')
+                    feature_columns.append(col)
         
         # Store feature columns for later use
         self.feature_columns = feature_columns
@@ -908,6 +844,10 @@ class NaiveBayesMovieRecommender:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_STATE
         )
+        
+        # Store test set for feature importance calculation
+        self.X_test = X_test
+        self.y_test = y_test
         
         # Train model
         self.model.fit(X_train, y_train.values)
@@ -1219,8 +1159,9 @@ class NaiveBayesMovieRecommender:
         has_categorical = len(categorical_scores) > 0
         
         if has_gaussian and has_categorical:
-            w_gaussian = 0.5
-            w_categorical = 0.5
+            # Normalize each type independently to 1.0 as they are not directly comparable
+            w_gaussian = 1.0
+            w_categorical = 1.0
         elif has_gaussian:
             w_gaussian = 1.0
             w_categorical = 0.0
@@ -1275,6 +1216,60 @@ class NaiveBayesMovieRecommender:
             
         return pd.DataFrame(importance_data).sort_values('importance', ascending=False)
     
+    def get_permutation_importance(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+        """
+        Calculate feature importance using Permutation Importance.
+        
+        This method is model-agnostic and provides a fair comparison between 
+        continuous and categorical features by measuring how much the model's
+        performance (MSE) deteriorates when a feature is randomly shuffled.
+        
+        Args:
+            X (pd.DataFrame): Feature DataFrame
+            y (pd.Series): Target ratings
+            
+        Returns:
+            pd.DataFrame: DataFrame containing feature importance scores (normalized to %)
+        """
+        if self.model is None:
+            raise ValueError("Model must be trained first")
+            
+        print("Calculating Permutation Importance (this may take a moment)...")
+        
+        # We need to pass the raw features because the pipeline handles transformation
+        result = permutation_importance(
+            self.model, X, y, n_repeats=5, random_state=42, n_jobs=-1, scoring='neg_mean_squared_error'
+        )
+
+        importance_data = []
+        for i, feature in enumerate(X.columns):
+            # result.importances_mean is the decrease in performance (increase in MSE)
+            # Since we used neg_mean_squared_error, a drop in performance is a negative number becoming MORE negative
+            # so we take the absolute value or just look at the magnitude of change.
+            # Actually, sklearn returns: score_baseline - score_shuffled
+            # Baseline (-1.0) - Shuffled (-1.5) = 0.5 (positive importance)
+            score = result.importances_mean[i]
+            
+            # Filter out negative importance (noise)
+            if score < 0:
+                score = 0
+                
+            importance_data.append({
+                'feature': feature,
+                'importance_raw': score
+            })
+            
+        df_imp = pd.DataFrame(importance_data)
+        
+        # Normalize to percentages
+        total_importance = df_imp['importance_raw'].sum()
+        if total_importance > 0:
+            df_imp['importance_pct'] = (df_imp['importance_raw'] / total_importance) * 100
+        else:
+            df_imp['importance_pct'] = 0.0
+            
+        return df_imp.sort_values('importance_pct', ascending=False)
+
     def get_feature_group_importance(self) -> pd.DataFrame:
         """
         Calculate cumulative importance for feature groups (Genres, Keywords, Cast, etc.).
@@ -1522,6 +1517,13 @@ class NaiveBayesMovieRecommender:
     def _get_user_favorite_genres(self, user_movies: pd.DataFrame, top_n: int = 3) -> List[str]:
         """
         Identify user's favorite genres based on their rating history.
+        
+        Args:
+            user_movies (pd.DataFrame): DataFrame containing movies rated by the user
+            top_n (int): Number of top genres to return. Defaults to 3.
+            
+        Returns:
+            List[str]: List of top N favorite genres
         """
         # Parse genres and calculate average ratings per genre
         genre_ratings = {}
@@ -1567,13 +1569,13 @@ def main():
     processor = NaiveBayesDataProcessor(config)
     
     # Load and process data
-    movies, credits, keywords, ratings = processor.load_data()
+    movies, credits, keywords, ratings, links = processor.load_data()
     
     # Filter reliable data
     ratings_filtered = processor.filter_reliable_data(ratings)
     
     # Merge datasets
-    merged_data = processor.merge_datasets(movies, credits, keywords, ratings_filtered)
+    merged_data = processor.merge_datasets(movies, credits, keywords, ratings_filtered, links)
     
     # Apply feature engineering
     print("\n=== Feature Engineering ===")
@@ -1649,94 +1651,60 @@ def main():
     # Display feature importance analysis
     print("\n=== Feature Importance Analysis ===")
     try:
-        feature_importance = recommender.get_feature_importance()
-        if not feature_importance.empty:
-            # Display Group Importance (New)
-            print("\n--- Feature Group Importance (Cumulative) ---")
-            group_importance = recommender.get_feature_group_importance()
-            if not group_importance.empty:
-                print(f"{'Feature Group':<20} {'Total Importance':<18} {'Count':<6} {'Top Features'}")
-                print("-" * 80)
-                for _, row in group_importance.iterrows():
-                    print(f"{row['feature_group']:<20} {row['total_importance']:.4f}             {row['feature_count']:<6} {row['top_features']}")
+        # Use Permutation Importance (rigorous comparison)
+        print("\n--- Permutation Importance (Global Comparison) ---")
+        # Use a subset of data for speed if dataset is huge
+        sample_size = min(5000, len(X))
+        X_sample = X.iloc[:sample_size]
+        y_sample = y.iloc[:sample_size]
+        
+        perm_importance_df = recommender.get_permutation_importance(X_sample, y_sample)
+        
+        print("\nTop 15 Features (Permutation Importance %):")
+        print(perm_importance_df.head(15)[['feature', 'importance_pct']].to_string(index=False, float_format='%.2f%%'))
+        
+        # Save permutation importance
+        with open('naive_bayes_permutation_importance.txt', 'w') as f:
+            f.write(perm_importance_df.to_string(index=False))
             
-            print("\n--- Top 15 Individual Features ---")
-            top_features = feature_importance.head(15)
-            for _, row in top_features.iterrows():
-                print(f"{row['feature']:<40} {row['importance']:.4f} ({row['model_type']})")
+        # --- Feature Group Summary ---
+        print("\n=== Feature Group Importance (Permutation) ===")
+        
+        group_map = {}
+        for feature in perm_importance_df['feature']:
+            if feature.startswith('genre_') or 'primary_genre' in feature:
+                group_map[feature] = 'Genres'
+            elif feature.startswith('keyword_'):
+                group_map[feature] = 'Keywords'
+            elif feature.startswith('actor_') or 'cast_size' in feature:
+                group_map[feature] = 'Actors'
+            elif feature.startswith('director_'):
+                group_map[feature] = 'Directors'
+            elif feature.startswith('user_'):
+                group_map[feature] = 'User Features'
+            elif feature.startswith('rating_') and 'count' not in feature:
+                group_map[feature] = 'Temporal Features'
+            else:
+                group_map[feature] = 'Movie Metadata' # budget, runtime, revenue, etc.
+
+        perm_importance_df['group'] = perm_importance_df['feature'].map(group_map)
+        
+        # Group by and aggregate
+        group_stats = perm_importance_df.groupby('group')['importance_pct'].agg(['sum', 'count']).reset_index()
+        group_stats.columns = ['Feature Group', 'Total Importance %', 'Feature Count']
+        group_stats = group_stats.sort_values('Total Importance %', ascending=False)
+        
+        print(group_stats.to_string(index=False, float_format='%.2f%%'))
+        
+        # Save group importance
+        with open('naive_bayes_group_importance.txt', 'w') as f:
+            f.write(group_stats.to_string(index=False))
             
-            # Show breakdown by model type
-            print(f"\nGaussian NB Features (top 5):")
-            gaussian_features = feature_importance[feature_importance['model_type'] == 'Gaussian_NB'].head(5)
-            for _, row in gaussian_features.iterrows():
-                print(f"  {row['feature']:<35} {row['importance']:.4f}")
-                
-            print(f"\nCategorical NB Features (top 5):")
-            categorical_features = feature_importance[feature_importance['model_type'] == 'Categorical_NB'].head(5)
-            for _, row in categorical_features.iterrows():
-                print(f"  {row['feature']:<35} {row['importance']:.4f}")
-        else:
-            print("No feature importance data available")
             
-        # Mathematical Explanation
-        print("\n=== MATHEMATICAL EXPLANATION OF FEATURE IMPORTANCE ===")
-        try:
-            math_explanation = recommender.explain_feature_importance_math()
-            
-            print("\n1. GAUSSIAN NB FEATURE IMPORTANCE:")
-            gauss_exp = math_explanation['gaussian_nb_explanation']
-            print(f"   Method: {gauss_exp['method']}")
-            print(f"   Formula: {gauss_exp['formula']}")
-            print(f"   Interpretation: {gauss_exp['interpretation']}")
-            
-            if 'example_calculation' in gauss_exp:
-                example = gauss_exp['example_calculation']
-                print(f"\n   Example with '{example['feature']}':")
-                print(f"   - Low rating class mean: {example['mean_low_rating']:.3f}")
-                print(f"   - Medium rating class mean: {example['mean_medium_rating']:.3f}")
-                print(f"   - High rating class mean: {example['mean_high_rating']:.3f}")
-                print(f"   - Variance across classes: {example['calculated_variance']:.4f}")
-                print(f"   - Step-by-step: {example['step_by_step']['step_1']}")
-                print(f"                   Overall mean = {example['step_by_step']['step_2'].split(': ')[1]}")
-                print(f"                   Final variance = {example['calculated_variance']:.4f}")
-            
-            print(f"\n2. CATEGORICAL NB FEATURE IMPORTANCE:")
-            cat_exp = math_explanation['categorical_nb_explanation']
-            print(f"   Method: {cat_exp['method']}")
-            print(f"   Formula: {cat_exp['formula']}")
-            print(f"   Interpretation: {cat_exp['interpretation']}")
-            print(f"   Note: {cat_exp['note']}")
-            
-            print(f"\n3. KEY MATHEMATICAL CONCEPTS:")
-            formulas = math_explanation['mathematical_formulas']
-            print(f"   - Naive Bayes: {formulas['naive_bayes_assumption']}")
-            print(f"   - Gaussian Likelihood: {formulas['gaussian_likelihood']}")
-            print(f"   - Variance: {formulas['variance_formula']}")
-            print(f"   - Entropy: {formulas['entropy_formula']}")
-            
-        except Exception as e:
-            print(f"Error in mathematical explanation: {e}")
-                
-            # Interpretation
-            print(f"\n=== Feature Importance Interpretation ===")
-            print("1. USER BEHAVIOR is the strongest predictor:")
-            print("   - user_rating_count: How many movies a user has rated")
-            print("   - user_avg_rating: User's average rating tendency")
-            print("   - user_activity_span: How long user has been active")
-            
-            print("\n2. MOVIE CHARACTERISTICS also matter:")
-            movie_features = [f for f in top_features['feature'] if any(x in f.lower() for x in ['budget', 'runtime', 'popularity', 'vote', 'age'])]
-            if movie_features:
-                print("   - " + "\n   - ".join(movie_features[:5]))
-                
-            print("\n3. CAST/CREW influence ratings:")
-            cast_features = [f for f in top_features['feature'] if 'actor_' in f or 'director_' in f]
-            if cast_features:
-                print("   - " + "\n   - ".join(cast_features[:3]))
-        else:
-            print("No feature importance data available")
     except Exception as e:
         print(f"Error calculating feature importance: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Demonstrate user recommendations
     print("\n=== User Recommendation Demo ===")
@@ -1829,8 +1797,7 @@ def print_feature_summary(features: List[str]):
     }
     
     # Special handling for temporal features
-    temporal_features = ['rating_year', 'rating_month', 'rating_day_of_week', 'is_weekend', 'rating_delay',
-                        'rating_year_binned_encoded', 'rating_delay_binned_encoded']
+    temporal_features = ['rating_year', 'rating_month', 'rating_day_of_week', 'is_weekend', 'rating_delay']
     
     grouped_counts = {k: 0 for k in groups}
     grouped_counts['Temporal'] = 0

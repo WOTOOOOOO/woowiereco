@@ -11,7 +11,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import LabelEncoder, StandardScaler, MultiLabelBinarizer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, precision_score, recall_score, confusion_matrix
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import ast
 import re
 from typing import Dict, List, Tuple, Optional
@@ -28,6 +28,7 @@ class MovieRecommenderConfig:
     CREDITS_FILE = "credits_cleaned.csv"
     KEYWORDS_FILE = "keywords_cleaned.csv"
     RATINGS_FILE = "ratings_cleaned.csv"
+    LINKS_FILE = "links.csv"
     
     # Random Forest parameters
     N_ESTIMATORS = 100
@@ -40,7 +41,7 @@ class MovieRecommenderConfig:
     # Feature engineering parameters
     MIN_MOVIE_RATINGS = 5  # Minimum ratings for a movie to be considered
     MIN_USER_RATINGS = 10   # Minimum ratings for a user to be considered
-    MAX_USERS = 10000        # Maximum number of users to consider (for performance)
+    MAX_USERS = 5000        # Maximum number of users to consider (for performance)
     MAX_ACTORS = 5          # Maximum number of lead actors to consider
     MAX_KEYWORDS = 10       # Maximum number of keywords to consider
     MIN_RELEASE_YEAR = 2000 # Only include movies released after this year
@@ -74,17 +75,18 @@ class DataProcessor:
         self.label_encoders = {}
         self.scaler = StandardScaler()
         
-    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Load all cleaned movie data files from the specified directory.
         
         Returns:
-            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: 
-                A tuple containing (movies, credits, keywords, ratings) DataFrames
+            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: 
+                A tuple containing (movies, credits, keywords, ratings, links) DataFrames
                 - movies: Movie metadata including titles, genres, budgets, revenues
                 - credits: Cast and crew information for each movie
                 - keywords: Movie keywords and themes
                 - ratings: User ratings with timestamps
+                - links: Mapping between MovieLens IDs and TMDb IDs
         
         Raises:
             FileNotFoundError: If any of the required data files are missing
@@ -96,9 +98,10 @@ class DataProcessor:
         credits = pd.read_csv(f"{self.config.DATA_PATH}{self.config.CREDITS_FILE}")
         keywords = pd.read_csv(f"{self.config.DATA_PATH}{self.config.KEYWORDS_FILE}")
         ratings = pd.read_csv(f"{self.config.DATA_PATH}{self.config.RATINGS_FILE}")
+        links = pd.read_csv(f"{self.config.DATA_PATH}{self.config.LINKS_FILE}")
         
-        print(f"Loaded: {len(movies)} movies, {len(credits)} credits, {len(keywords)} keywords, {len(ratings)} ratings")
-        return movies, credits, keywords, ratings
+        print(f"Loaded: {len(movies)} movies, {len(credits)} credits, {len(keywords)} keywords, {len(ratings)} ratings, {len(links)} links")
+        return movies, credits, keywords, ratings, links
     
     def filter_reliable_data(self, ratings: pd.DataFrame) -> pd.DataFrame:
         """
@@ -190,13 +193,13 @@ class DataProcessor:
         return series.apply(safe_parse)
     
     def merge_datasets(self, movies: pd.DataFrame, credits: pd.DataFrame, 
-                      keywords: pd.DataFrame, ratings: pd.DataFrame) -> pd.DataFrame:
+                      keywords: pd.DataFrame, ratings: pd.DataFrame, links: pd.DataFrame) -> pd.DataFrame:
         """
         Merge all movie-related datasets into a single comprehensive DataFrame.
         
         Performs left joins to combine ratings with movie metadata, cast/crew
-        information, and keywords. Also applies release year filtering to focus
-        on modern movies (post-2000).
+        information, and keywords. Uses links table to bridge MovieLens IDs and TMDb IDs.
+        Also applies release year filtering to focus on modern movies (post-2000).
         
         Args:
             movies (pd.DataFrame): Movie metadata with columns like title, genres,
@@ -205,6 +208,7 @@ class DataProcessor:
                                   cast_size columns
             keywords (pd.DataFrame): Movie keywords and themes
             ratings (pd.DataFrame): User ratings (already filtered for reliability)
+            links (pd.DataFrame): Mapping between MovieLens IDs and TMDb IDs
         
         Returns:
             pd.DataFrame: Merged DataFrame containing all features needed for
@@ -221,17 +225,29 @@ class DataProcessor:
         # Start with ratings as base
         merged = ratings.copy()
         
-        # Merge with movies
-        merged = merged.merge(movies, left_on='movieId', right_on='id', how='left')
+        # Merge ratings (movieId) with links (movieId) to get tmdbId
+        merged = merged.merge(links[['movieId', 'tmdbId']], on='movieId', how='left')
         
-        # Merge with credits
+        # Drop rows where tmdbId is missing (cannot link to metadata)
+        initial_count = len(merged)
+        merged = merged.dropna(subset=['tmdbId'])
+        if len(merged) < initial_count:
+            print(f"Dropped {initial_count - len(merged)} ratings with no valid link to TMDb ID")
+        
+        # Ensure tmdbId is integer for merging
+        merged['tmdbId'] = merged['tmdbId'].astype(int)
+        
+        # Merge with movies using tmdbId -> id
+        merged = merged.merge(movies, left_on='tmdbId', right_on='id', how='left')
+        
+        # Merge with credits using tmdbId -> id
         if self.config.USE_ACTORS or self.config.USE_DIRECTORS:
             merged = merged.merge(credits[['id', 'lead_actors', 'directors', 'cast_size']], 
-                                left_on='movieId', right_on='id', how='left', suffixes=('', '_credits'))
+                                left_on='tmdbId', right_on='id', how='left', suffixes=('', '_credits'))
         
-        # Merge with keywords
+        # Merge with keywords using tmdbId -> id
         if self.config.USE_KEYWORDS:
-            merged = merged.merge(keywords, left_on='movieId', right_on='id', how='left', suffixes=('', '_keywords'))
+            merged = merged.merge(keywords, left_on='tmdbId', right_on='id', how='left', suffixes=('', '_keywords'))
         
         # Filter movies by release year (only movies after MIN_RELEASE_YEAR)
         print(f"Filtering movies released after {self.config.MIN_RELEASE_YEAR}...")
@@ -257,12 +273,10 @@ class DataProcessor:
         Returns:
             pd.DataFrame: Enhanced DataFrame with additional columns:
                 - genre_{genre_name}: Binary features (0/1) for each unique genre
-                - genre_count_filled: Number of genres per movie (NaN filled with 0)
                 - genres_list: Parsed list objects from genre strings
         
         Features Created:
             - Binary encoding for each genre (e.g., 'genre_action', 'genre_comedy')
-            - Genre diversity metric (genre_count_filled)
             - Handles missing values and normalizes genre names
         
         Note:
@@ -302,8 +316,6 @@ class DataProcessor:
         # Merge with main DataFrame
         df = pd.concat([df, genre_df], axis=1)
         
-        # Add genre count feature
-        df['genre_count_filled'] = df['genre_count'].fillna(0)
         
         print(f"Created {len(genre_columns)} genre features")
         return df
@@ -433,7 +445,6 @@ class DataProcessor:
         Returns:
             pd.DataFrame: Enhanced DataFrame with additional columns:
                 - keyword_tfidf_{i}: TF-IDF weighted keyword features (i=0 to MAX_KEYWORD_FEATURES-1)
-                - keyword_count_filled: Number of keywords per movie
                 - keywords_list: Parsed keyword list objects  
                 - keywords_text: Space-separated keyword strings for TF-IDF
         
@@ -442,9 +453,6 @@ class DataProcessor:
             - Converts keywords to TF-IDF vectors (MAX_KEYWORD_FEATURES dimensions)
             - Captures keyword importance and rarity across the dataset
             - Filters English stop words
-            
-            Keyword Statistics:
-            - Count of keywords per movie as numerical feature
         
         Algorithm:
             1. Parse keyword lists and limit to MAX_KEYWORDS per movie
@@ -470,21 +478,21 @@ class DataProcessor:
         )
         
         # Apply TF-IDF (limit to top features to avoid overfitting)
-        tfidf = TfidfVectorizer(max_features=self.config.MAX_KEYWORD_FEATURES, stop_words='english')
+        max_features = self.config.MAX_KEYWORD_FEATURES
+        tfidf = TfidfVectorizer(max_features=max_features, stop_words='english')
         keyword_tfidf = tfidf.fit_transform(df['keywords_text'])
         
         # Create DataFrame with TF-IDF features
+        # Use actual words in column names for interpretability (e.g., keyword_hero)
         keyword_features = pd.DataFrame(
             keyword_tfidf.toarray(),
-            columns=[f'keyword_tfidf_{i}' for i in range(keyword_tfidf.shape[1])],
+            columns=[f'keyword_{word}' for word in tfidf.get_feature_names_out()],
             index=df.index
         )
         
         # Merge with main DataFrame
         df = pd.concat([df, keyword_features], axis=1)
         
-        # Add keyword count feature
-        df['keyword_count_filled'] = df['keyword_count'].fillna(0)
         
         return df
     
@@ -727,7 +735,6 @@ class RandomForestRecommender:
             
             Keyword Features (if USE_KEYWORDS=True):
             - TF-IDF keyword vectors
-            - Keyword count feature
         
         Side Effects:
             - Sets self.feature_columns for later use in predictions
@@ -747,7 +754,7 @@ class RandomForestRecommender:
             basic_features = [
                 'release_year_filled', 'runtime_filled', 'budget_log', 'revenue_log',
                 'vote_average_filled', 'vote_count_log', 'popularity_filled',
-                'movie_age', 'profit_log', 'roi', 'genre_count_filled'
+                'movie_age', 'profit_log', 'roi'
             ]
             feature_columns.extend([col for col in basic_features if col in df.columns])
             
@@ -780,15 +787,23 @@ class RandomForestRecommender:
         
         # Genre features
         if self.config.USE_GENRES:
-            genre_features = [col for col in df.columns if col.startswith('genre_')]
+            # Exclude metadata columns that start with genre_
+            genre_features = [
+                col for col in df.columns 
+                if col.startswith('genre_') 
+                and col not in ['genre_count']
+            ]
             feature_columns.extend(genre_features)
         
         # Keyword features
         if self.config.USE_KEYWORDS:
-            keyword_features = [col for col in df.columns if col.startswith('keyword_')]
+            # Exclude metadata columns that start with keyword_
+            keyword_features = [
+                col for col in df.columns 
+                if col.startswith('keyword_') 
+                and col not in ['keyword_count']
+            ]
             feature_columns.extend(keyword_features)
-            if 'keyword_count_filled' in df.columns:
-                feature_columns.append('keyword_count_filled')
         
         # Store feature columns for later use
         self.feature_columns = feature_columns
@@ -1034,13 +1049,15 @@ class RandomForestRecommender:
             'Movie Features': [col for col in self.feature_columns if col in [
                 'release_year_filled', 'runtime_filled', 'budget_log', 'revenue_log',
                 'vote_average_filled', 'vote_count_log', 'popularity_filled',
-                'movie_age', 'profit_log', 'roi', 'genre_count_filled',
+                'movie_age', 'profit_log', 'roi',
                 'original_language_encoded', 'primary_genre_encoded', 'cast_size_filled'
             ]],
-            'User Features': [col for col in self.feature_columns if col.startswith('user_')]
+            'User Features': [col for col in self.feature_columns if col.startswith('user_')],
+            'Temporal Features': [col for col in self.feature_columns if col in [
+                'rating_year', 'rating_month', 'rating_day_of_week', 'is_weekend', 'rating_delay'
+            ]]
         }
         
-        print("\n=== Feature Group Importance ===")
         group_importance = {}
         for group_name, features in feature_groups.items():
             if features:  # Only if group has features
@@ -1050,7 +1067,6 @@ class RandomForestRecommender:
                     'feature_count': len(features),
                     'avg_importance': group_total / len(features) if features else 0
                 }
-                print(f"{group_name}: {group_total:.4f} ({group_total*100:.1f}%) across {len(features)} features")
         
         # Store group importance for later use
         self.feature_group_importance = group_importance
@@ -1363,13 +1379,13 @@ def main():
     processor = DataProcessor(config)
     
     # Load and process data
-    movies, credits, keywords, ratings = processor.load_data()
+    movies, credits, keywords, ratings, links = processor.load_data()
     
     # Filter reliable data
     ratings_filtered = processor.filter_reliable_data(ratings)
     
     # Merge datasets
-    merged_data = processor.merge_datasets(movies, credits, keywords, ratings_filtered)
+    merged_data = processor.merge_datasets(movies, credits, keywords, ratings_filtered, links)
     
     # Apply feature engineering
     print("\n=== Feature Engineering ===")
@@ -1426,10 +1442,28 @@ def main():
     print(f"\nPrecision@Top20%: {metrics['precision_top20']:.4f} ({metrics['precision_top20']*100:.1f}%)")
     print(f"Recall@Top20%: {metrics['recall_top20']:.4f} ({metrics['recall_top20']*100:.1f}%)")
     
-    # Display feature importance
-    print("\n=== Top 20 Most Important Features ===")
+    # Display feature importance analysis
+    print("\n=== Feature Importance Analysis ===")
+    
+    # Get feature importance (MDI)
     feature_importance = recommender.get_feature_importance()
-    print(feature_importance.head(20).to_string(index=False))
+    
+    # Format for display (match Naive Bayes visual style)
+    feature_importance['importance_pct'] = feature_importance['importance'] * 100
+    
+    print("\nTop 15 Features (MDI Importance %):")
+    print(feature_importance.head(15)[['feature', 'importance_pct']].to_string(index=False, float_format='%.2f%%'))
+    
+    # Get group analysis
+    group_df = recommender.get_feature_group_analysis()
+    
+    # Format group stats to match Naive Bayes columns
+    # Naive Bayes: ['Feature Group', 'Total Importance %', 'Feature Count']
+    group_stats = group_df[['group', 'importance_percentage', 'feature_count']].copy()
+    group_stats.columns = ['Feature Group', 'Total Importance %', 'Feature Count']
+    
+    print("\n=== Feature Group Importance (MDI) ===")
+    print(group_stats.to_string(index=False, float_format='%.2f%%'))
     
     # Display standardized feature summary
     print_feature_summary(recommender.feature_columns)
